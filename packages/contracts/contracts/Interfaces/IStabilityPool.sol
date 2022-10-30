@@ -126,7 +126,6 @@ interface IStabilityPool {
      * - Leaves their compounded deposit in the Stability Pool
      * - Updates snapshots for deposit and tagged front end stake
      */
-    function withdrawETHGainToTrove(address _upperHint, address _lowerHint) external;
 
     /*
      * Initial checks:

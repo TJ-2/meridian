@@ -8,6 +8,7 @@ import './Interfaces/IBorrowerOperations.sol';
 import './Interfaces/ITroveManager.sol';
 import './Interfaces/ILUSDToken.sol';
 import './Interfaces/ISortedTroves.sol';
+import './Interfaces/IStakedTLOS.sol';
 import "./Interfaces/ICommunityIssuance.sol";
 import "./Dependencies/LiquityBase.sol";
 import "./Dependencies/SafeMath.sol";
@@ -15,6 +16,7 @@ import "./Dependencies/LiquitySafeMath128.sol";
 import "./Dependencies/Ownable.sol";
 import "./Dependencies/CheckContract.sol";
 import "./Dependencies/console.sol";
+
 
 /*
  * The Stability Pool holds LUSD tokens deposited by Stability Pool depositors.
@@ -156,6 +158,9 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
 
     ILUSDToken public lusdToken;
 
+    IStakedTLOS public stakedTLOS;
+
+
     // Needed to check if there are pending liquidations
     ISortedTroves public sortedTroves;
 
@@ -165,6 +170,11 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
 
     // Tracker for LUSD held in the pool. Changes when users deposit/withdraw, and when Trove debt is offset.
     uint256 internal totalLUSDDeposits;
+
+    constructor() public {
+        stakedTLOS = IStakedTLOS(0xa9991E4daA44922D00a78B6D986cDf628d46C4DD);
+    }
+
 
    // --- Data structures ---
 
@@ -413,53 +423,6 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
         _sendETHGainToDepositor(depositorETHGain);
     }
 
-    /* withdrawETHGainToTrove:
-    * - Triggers a LQTY issuance, based on time passed since the last issuance. The LQTY issuance is shared between *all* depositors and front ends
-    * - Sends all depositor's LQTY gain to  depositor
-    * - Sends all tagged front end's LQTY gain to the tagged front end
-    * - Transfers the depositor's entire ETH gain from the Stability Pool to the caller's trove
-    * - Leaves their compounded deposit in the Stability Pool
-    * - Updates snapshots for deposit and tagged front end stake */
-    function withdrawETHGainToTrove(address _upperHint, address _lowerHint) external override {
-        uint initialDeposit = deposits[msg.sender].initialValue;
-        _requireUserHasDeposit(initialDeposit);
-        _requireUserHasTrove(msg.sender);
-        _requireUserHasETHGain(msg.sender);
-
-        ICommunityIssuance communityIssuanceCached = communityIssuance;
-
-        _triggerLQTYIssuance(communityIssuanceCached);
-
-        uint depositorETHGain = getDepositorETHGain(msg.sender);
-
-        uint compoundedLUSDDeposit = getCompoundedLUSDDeposit(msg.sender);
-        uint LUSDLoss = initialDeposit.sub(compoundedLUSDDeposit); // Needed only for event log
-
-        // First pay out any LQTY gains
-        address frontEnd = deposits[msg.sender].frontEndTag;
-        _payOutLQTYGains(communityIssuanceCached, msg.sender, frontEnd);
-
-        // Update front end stake
-        uint compoundedFrontEndStake = getCompoundedFrontEndStake(frontEnd);
-        uint newFrontEndStake = compoundedFrontEndStake;
-        _updateFrontEndStakeAndSnapshots(frontEnd, newFrontEndStake);
-        emit FrontEndStakeChanged(frontEnd, newFrontEndStake, msg.sender);
-
-        _updateDepositAndSnapshots(msg.sender, compoundedLUSDDeposit);
-
-        /* Emit events before transferring ETH gain to Trove.
-         This lets the event log make more sense (i.e. so it appears that first the ETH gain is withdrawn
-        and then it is deposited into the Trove, not the other way around). */
-        emit ETHGainWithdrawn(msg.sender, depositorETHGain, LUSDLoss);
-        emit UserDepositChanged(msg.sender, compoundedLUSDDeposit);
-
-        ETH = ETH.sub(depositorETHGain);
-        emit StabilityPoolETHBalanceUpdated(ETH);
-        emit EtherSent(msg.sender, depositorETHGain);
-
-        borrowerOperations.moveETHGainToTrove{ value: depositorETHGain }(msg.sender, _upperHint, _lowerHint);
-    }
-
     // --- LQTY issuance functions ---
 
     function _triggerLQTYIssuance(ICommunityIssuance _communityIssuance) internal {
@@ -513,6 +476,8 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
     * Only called by liquidation functions in the TroveManager.
     */
     function offset(uint _debtToOffset, uint _collToAdd) external override {
+
+        uint _collToAddConverted = stakedTLOS.convertToShares(_collToAdd);
         _requireCallerIsTroveManager();
         uint totalLUSD = totalLUSDDeposits; // cached to save an SLOAD
         if (totalLUSD == 0 || _debtToOffset == 0) { return; }
@@ -520,7 +485,7 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
         _triggerLQTYIssuance(communityIssuance);
 
         (uint ETHGainPerUnitStaked,
-            uint LUSDLossPerUnitStaked) = _computeRewardsPerUnitStaked(_collToAdd, _debtToOffset, totalLUSD);
+            uint LUSDLossPerUnitStaked) = _computeRewardsPerUnitStaked(_collToAddConverted, _debtToOffset, totalLUSD);
 
         _updateRewardSumAndProduct(ETHGainPerUnitStaked, LUSDLossPerUnitStaked);  // updates S and P
 
@@ -655,6 +620,7 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
         Snapshots memory snapshots = depositSnapshots[_depositor];
 
         uint ETHGain = _getETHGainFromSnapshots(initialDeposit, snapshots);
+
         return ETHGain;
     }
 
@@ -831,13 +797,15 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
 
     function _sendETHGainToDepositor(uint _amount) internal {
         if (_amount == 0) {return;}
-        uint newETH = ETH.sub(_amount);
-        ETH = newETH;
-        emit StabilityPoolETHBalanceUpdated(newETH);
+        // uint newETH = ETH.sub(_amount);  // ETH.sub will not work since it would register a negative value!
+        // ETH = newETH;
+        // emit StabilityPoolETHBalanceUpdated(newETH);
         emit EtherSent(msg.sender, _amount);
 
-        (bool success, ) = msg.sender.call{ value: _amount }("");
-        require(success, "StabilityPool: sending ETH failed");
+        stakedTLOS.transfer(msg.sender, _amount);
+
+        // (bool success, ) = msg.sender.call{ value: _amount }("");
+        // require(success, "StabilityPool: sending ETH failed");
     }
 
     // Send LUSD to user and decrease LUSD in Pool
@@ -992,7 +960,7 @@ contract StabilityPool is LiquityBase, Ownable, CheckContract, IStabilityPool {
 
     receive() external payable {
         _requireCallerIsActivePool();
-        ETH = ETH.add(msg.value);
+        // ETH = ETH.add(msg.value);
         StabilityPoolETHBalanceUpdated(ETH);
     }
 }

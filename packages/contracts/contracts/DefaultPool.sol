@@ -1,12 +1,15 @@
+
 // SPDX-License-Identifier: MIT
 
 pragma solidity 0.6.11;
 
+import './Interfaces/IStakedTLOS.sol';
 import './Interfaces/IDefaultPool.sol';
 import "./Dependencies/SafeMath.sol";
 import "./Dependencies/Ownable.sol";
 import "./Dependencies/CheckContract.sol";
 import "./Dependencies/console.sol";
+
 
 /*
  * The Default Pool holds the ETH and LUSD debt (but not LUSD tokens) from liquidations that have been redistributed
@@ -22,12 +25,18 @@ contract DefaultPool is Ownable, CheckContract, IDefaultPool {
 
     address public troveManagerAddress;
     address public activePoolAddress;
-    uint256 internal ETH;  // deposited ETH tracker
     uint256 internal LUSDDebt;  // debt
 
     event TroveManagerAddressChanged(address _newTroveManagerAddress);
     event DefaultPoolLUSDDebtUpdated(uint _LUSDDebt);
     event DefaultPoolETHBalanceUpdated(uint _ETH);
+
+    IStakedTLOS public stakedTLOS;
+
+    constructor() public {
+        stakedTLOS = IStakedTLOS(0xa9991E4daA44922D00a78B6D986cDf628d46C4DD);
+    }
+
 
     // --- Dependency setters ---
 
@@ -58,6 +67,8 @@ contract DefaultPool is Ownable, CheckContract, IDefaultPool {
     * Not necessarily equal to the the contract's raw ETH balance - ether can be forcibly sent to contracts.
     */
     function getETH() external view override returns (uint) {
+        uint sTLOS = stakedTLOS.balanceOf(address(this));
+        uint ETH = stakedTLOS.convertToAssets(sTLOS);
         return ETH;
     }
 
@@ -70,12 +81,16 @@ contract DefaultPool is Ownable, CheckContract, IDefaultPool {
     function sendETHToActivePool(uint _amount) external override {
         _requireCallerIsTroveManager();
         address activePool = activePoolAddress; // cache to save an SLOAD
-        ETH = ETH.sub(_amount);
-        emit DefaultPoolETHBalanceUpdated(ETH);
+        uint sTLOS = stakedTLOS.balanceOf(address(this));
+        uint TLOS = stakedTLOS.convertToAssets(sTLOS);
+        emit DefaultPoolETHBalanceUpdated(TLOS);
         emit EtherSent(activePool, _amount);
 
-        (bool success, ) = activePool.call{ value: _amount }("");
-        require(success, "DefaultPool: sending ETH failed");
+        uint sTLOSToSend = stakedTLOS.convertToShares(_amount);
+        stakedTLOS.transfer(activePool, sTLOSToSend);
+
+        // (bool success, ) = activePool.call{ value: _amount }("");
+        // require(success, "DefaultPool: sending ETH failed");
     }
 
     function increaseLUSDDebt(uint _amount) external override {
@@ -90,6 +105,7 @@ contract DefaultPool is Ownable, CheckContract, IDefaultPool {
         emit DefaultPoolLUSDDebtUpdated(LUSDDebt);
     }
 
+
     // --- 'require' functions ---
 
     function _requireCallerIsActivePool() internal view {
@@ -98,13 +114,5 @@ contract DefaultPool is Ownable, CheckContract, IDefaultPool {
 
     function _requireCallerIsTroveManager() internal view {
         require(msg.sender == troveManagerAddress, "DefaultPool: Caller is not the TroveManager");
-    }
-
-    // --- Fallback function ---
-
-    receive() external payable {
-        _requireCallerIsActivePool();
-        ETH = ETH.add(msg.value);
-        emit DefaultPoolETHBalanceUpdated(ETH);
     }
 }
